@@ -59,8 +59,11 @@ def pairing_uri(code: str, instance_id: str, name: str, urls: list[str]) -> str:
 def qr_svg(text: str) -> str:
     import segno  # noqa: PLC0415
 
-    # Standard 4-module quiet zone; medium error correction.
-    return segno.make(text, error="m").svg_inline(scale=8, border=4, dark="#000", light="#fff")
+    # Standard 4-module quiet zone; medium error correction. omitsize gives the
+    # SVG a viewBox and no fixed width/height, so it scales to whatever box shows
+    # it. Without it a smaller box crops the code to its top-left corner, which
+    # no camera can read.
+    return segno.make(text, error="m").svg_inline(scale=8, border=4, dark="#000", light="#fff", omitsize=True)
 
 
 @websocket_api.websocket_command({vol.Required("type"): f"{DOMAIN}/state"})

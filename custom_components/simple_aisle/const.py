@@ -19,6 +19,12 @@ LEASE_SECONDS = 90
 OPS_PER_SYNC = 100
 DEFER_MAX_SECONDS = 7 * 24 * 3600
 DEFER_MAX_ATTEMPTS = 50
+# A device that just deferred an op isn't offered it again for this long, so it
+# can't use up the op's attempts before another device gets a turn.
+DEFER_COOLDOWN_SECONDS = 60
+# After a device applies an op, later ops for the same entry go to that device
+# for this long: the others may not have its change from iCloud yet.
+AFFINITY_SECONDS = 600
 DONE_RETENTION_SECONDS = 14 * 24 * 3600
 TOMBSTONE_RETENTION_SECONDS = 90 * 24 * 3600
 POLL_SECONDS = 60

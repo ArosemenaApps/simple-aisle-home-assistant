@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 import hashlib
@@ -21,7 +22,9 @@ from typing import Any, Protocol
 import uuid
 
 from .const import (
+    AFFINITY_SECONDS,
     COMPLETED,
+    DEFER_COOLDOWN_SECONDS,
     DEFER_MAX_ATTEMPTS,
     DEFER_MAX_SECONDS,
     DONE_RETENTION_SECONDS,
@@ -52,6 +55,8 @@ from .const import (
     STATE_PENDING,
     TOMBSTONE_RETENTION_SECONDS,
 )
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class SyncError(Exception):
@@ -116,6 +121,9 @@ def empty_state() -> dict[str, Any]:
         "ops": [],
         "next_seq": 1,
         "journal": [],
+        # HA items Simple Aisle put on a list and must take off again (a store
+        # went private or was unlinked with its items), kept until done.
+        "cleanup": [],
         "stats": {},
     }
 
@@ -393,7 +401,8 @@ class Engine:
             total = 0
             for link in list(self.state["links"].values()):
                 total += await self._observe_locked(link["entity_id"])
-            if total:
+            retried = await self._retry_unfinished({})
+            if total or retried:
                 await self._commit()
             return total
 
@@ -425,9 +434,16 @@ class Engine:
         queued = 0
         current = {item.uid: item for item in items}
 
+        doomed = self._doomed_uids(entity_id)
         for item in items:
             before = known.get(item.uid)
             entry_id = self._entry_for_uid(entity_id, item.uid)
+            if item.uid in doomed:
+                # Simple Aisle already removed or bought it and HA hasn't caught
+                # up (its list was unavailable, or HA restarted mid-way). What
+                # happens to it in HA meanwhile isn't a new change.
+                known[item.uid] = item.snapshot()
+                continue
             if before is None:
                 if item.status == NEEDS_ACTION:
                     op = self._enqueue(OP_ADD, store_id=store_id, entity_id=entity_id, uid=item.uid, entry_id=None,
@@ -459,8 +475,13 @@ class Engine:
                 if pending_add is not None:
                     pending_add["data"].update(self._text(entity_id, item))
                 else:
+                    # The text HA showed before, so the app changes only the
+                    # fields HA changed and Simple Aisle hasn't changed since.
+                    base = self._text(entity_id, Item(item.uid, before["summary"], before["status"],
+                                                      before.get("description")))
                     self._enqueue(OP_EDIT, store_id=store_id, entity_id=entity_id, uid=item.uid, entry_id=entry_id,
-                                  data=self._text(entity_id, item))
+                                  data={**self._text(entity_id, item), "base_summary": base["summary"],
+                                        "base_description": base["description"]})
                     queued += 1
             if status_changed:
                 mapping = self._mapping(entry_id)
@@ -486,6 +507,10 @@ class Engine:
             if entry_id is None:
                 continue
             mapping = self._mapping(entry_id)
+            if uid in doomed:
+                if mapping is not None:
+                    mapping["uid"] = None  # already gone: the pending tombstone is done
+                continue
             if before["status"] == NEEDS_ACTION:
                 pending_add = self._undelivered_add(entity_id, uid)
                 if pending_add is not None:
@@ -496,7 +521,8 @@ class Engine:
                             op["finished_at"] = self.now()
                     self.state["mappings"].pop(entry_id, None)
                     continue
-                self._enqueue(OP_REMOVE, store_id=store_id, entity_id=entity_id, uid=uid, entry_id=entry_id)
+                self._enqueue(OP_REMOVE, store_id=store_id, entity_id=entity_id, uid=uid, entry_id=entry_id,
+                              data={"base_version": int((mapping or {}).get("version") or 0)})
                 queued += 1
             # Cleared after completion: the completion is already queued.
             if mapping is not None:
@@ -519,6 +545,7 @@ class Engine:
                     continue
                 await self._observe_locked(link["entity_id"])
                 items_by_entity[link["entity_id"]] = await self.backend.get_items(link["entity_id"])
+            await self._retry_unfinished(items_by_entity)
 
             confirmed_tombstones: list[str] = []
             if request.get("state_complete"):
@@ -544,19 +571,52 @@ class Engine:
             }
 
     def _lease(self, device_id: str) -> list[dict[str, Any]]:
+        """Ops for this device, oldest first. Ops for one entry stay in order
+        across devices: a later op is never handed out while an earlier one for
+        the same entry is with (or reserved for) another device."""
         now = self.now()
         leased: list[dict[str, Any]] = []
+        held: set[str] = set()  # entries with an earlier op this device can't have
+        owners = self._affinities(now)
         for op in sorted(self._pending_ops(), key=lambda o: o["seq"]):
             if len(leased) >= OPS_PER_SYNC:
                 break
-            holder = op.get("lease_device")
-            if holder and holder != device_id and (op.get("lease_until") or 0) > now:
+            if op["entry_id"] in held:
+                continue
+            if not self._may_lease(op, device_id, now, owners):
+                held.add(op["entry_id"])
                 continue
             op["lease_device"] = device_id
             op["lease_until"] = now + LEASE_SECONDS
             op["delivered"] = True
             leased.append(op)
         return leased
+
+    def _may_lease(self, op: dict[str, Any], device_id: str, now: float, owners: dict[str, str]) -> bool:
+        holder = op.get("lease_device")
+        if holder and holder != device_id and holder in self.state["devices"] \
+                and (op.get("lease_until") or 0) > now:
+            return False
+        if (op.get("cooldown") or {}).get(device_id, 0) > now:
+            return False
+        owner = owners.get(op["entry_id"])
+        return owner is None or owner == device_id
+
+    def _affinities(self, now: float) -> dict[str, str]:
+        """Entry → the device that most recently applied a change to it, while
+        that change may still be on its way to the others through iCloud."""
+        latest: dict[str, dict[str, Any]] = {}
+        for op in self.state["ops"]:
+            if op["state"] != STATE_DONE or op.get("result") not in (RESULT_APPLIED, RESULT_DUPLICATE):
+                continue
+            if op.get("applied_by") not in self.state["devices"]:
+                continue  # revoked
+            if now - op.get("finished_at", 0) >= AFFINITY_SECONDS:
+                continue
+            previous = latest.get(op["entry_id"])
+            if previous is None or op["finished_at"] >= previous["finished_at"]:
+                latest[op["entry_id"]] = op
+        return {entry_id: op["applied_by"] for entry_id, op in latest.items()}
 
     @staticmethod
     def _public_op(op: dict[str, Any]) -> dict[str, Any]:
@@ -584,12 +644,14 @@ class Engine:
             if status == RESULT_DEFERRED:
                 op["lease_device"] = None
                 op["lease_until"] = None
+                op.setdefault("cooldown", {})[device_id] = now + DEFER_COOLDOWN_SECONDS
                 op["attempts"] = op.get("attempts", 0) + 1
                 op.setdefault("deferred_since", now)
                 op["last_reason"] = str(result.get("reason") or "")[:80]
                 if op["attempts"] >= DEFER_MAX_ATTEMPTS or now - op["deferred_since"] > DEFER_MAX_SECONDS:
                     op["state"] = STATE_FAILED
                     op["finished_at"] = now
+                    self._drop_dependents(op)
                 continue
             op["finished_at"] = now
             op["result"] = status
@@ -597,12 +659,23 @@ class Engine:
             if status == RESULT_REJECTED:
                 op["state"] = STATE_FAILED
                 op["last_reason"] = str(result.get("reason") or "")[:80]
+                self._drop_dependents(op)
                 continue
             op["state"] = STATE_DONE
             result_entry = str(result.get("entry_id") or "").lower() or None
             if op["type"] in (OP_ADD, OP_UNCOMPLETE) and result_entry and result_entry != op["entry_id"]:
                 self._remap(op, result_entry, duplicate=status == RESULT_DUPLICATE)
+                op["entry_id"] = result_entry  # so later ops for it follow this device (_affinity)
         return confirmed
+
+    def _drop_dependents(self, op: dict[str, Any]) -> None:
+        """An add that will never happen: later changes to that item can't either."""
+        if op["type"] not in (OP_ADD, OP_UNCOMPLETE):
+            return
+        for later in self._pending_ops():
+            if later["entry_id"] == op["entry_id"] and later["seq"] > op["seq"]:
+                later["state"] = STATE_CANCELLED
+                later["finished_at"] = self.now()
 
     def _remap(self, op: dict[str, Any], result_entry: str, *, duplicate: bool) -> None:
         """The app put this HA item on an entry other than the provisional one."""
@@ -612,7 +685,12 @@ class Engine:
         if duplicate and existing and existing.get("uid") and existing.get("uid") != uid \
                 and existing.get("entity_id") == op["entity_id"]:
             # Already on that list as another HA item: this one is the duplicate.
+            # It's taken off the list, so later changes to it are moot.
             self.state.setdefault("pending_removals", []).append({"entity_id": op["entity_id"], "uid": uid})
+            for later in self._pending_ops():
+                if later["entry_id"] == op["entry_id"]:
+                    later["state"] = STATE_CANCELLED
+                    later["finished_at"] = self.now()
             return
         self._set_mapping(result_entry, store_id=op["store_id"], entity_id=op["entity_id"], uid=uid, tombstoned=False)
         for later in self._pending_ops():
@@ -627,24 +705,26 @@ class Engine:
                 continue
             if store.get("name"):
                 link["store_name"] = str(store["name"])[:100]
+            # A store that went private, archived or deleted stays paused until
+            # someone turns it back on in Simple Aisle (POST /links). A device
+            # still reporting it as eligible may just not have that change from
+            # iCloud yet, so "eligible" never resumes a store by itself.
             if store.get("eligible") is False and link["state"] != LINK_SUSPENDED:
-                await self._remove_mapped_items(link)
                 link["state"] = LINK_SUSPENDED
                 link["suspended_reason"] = str(store.get("reason") or "not_eligible")[:40]
-            elif store.get("eligible") is True and link["state"] == LINK_SUSPENDED \
-                    and link.get("suspended_reason") != "user":
-                link["state"] = LINK_ACTIVE
-                link.pop("suspended_reason", None)
+                await self._remove_mapped_items(link)
 
     async def _remove_mapped_items(self, link: dict[str, Any]) -> None:
+        """Takes Simple Aisle's items off a list (nothing else on it). The
+        removals are written down first and retried until they happen, so a
+        list that's unavailable, or an HA restart, can't leave them behind."""
         entity_id = link["entity_id"]
         uids = [m["uid"] for m in self.state["mappings"].values()
                 if m.get("entity_id") == entity_id and m.get("uid")]
-        if uids:
-            try:
-                await self.backend.remove(entity_id, uids)
-            except Exception:  # noqa: BLE001 - the list may be gone; mappings still go
-                pass
+        cleanup = self.state["cleanup"]
+        for uid in uids:
+            if not any(c["entity_id"] == entity_id and c["uid"] == uid for c in cleanup):
+                cleanup.append({"entity_id": entity_id, "uid": uid})
         known = self.state["known"].get(entity_id, {})
         for uid in uids:
             known.pop(uid, None)
@@ -654,11 +734,60 @@ class Engine:
             if op["entity_id"] == entity_id:
                 op["state"] = STATE_CANCELLED
                 op["finished_at"] = self.now()
+        await self._commit()
+        await self._run_cleanup({}, only=entity_id)
+
+    def _doomed_uids(self, entity_id: str) -> set[str]:
+        """Items on this list Simple Aisle has finished with but HA hasn't yet."""
+        doomed = {c["uid"] for c in self.state["cleanup"] if c["entity_id"] == entity_id}
+        doomed |= {m["uid"] for m in self.state["mappings"].values()
+                   if m.get("entity_id") == entity_id and m.get("uid") and m.get("pending_tombstone")}
+        return doomed
+
+    async def _items(self, entity_id: str, items_by_entity: dict[str, list[Item] | None]) -> list[Item] | None:
+        if entity_id not in items_by_entity:
+            items_by_entity[entity_id] = await self.backend.get_items(entity_id)
+        return items_by_entity[entity_id]
+
+    async def _run_cleanup(self, items_by_entity: dict[str, list[Item] | None], only: str | None = None) -> bool:
+        """Removes what's in the cleanup queue. Returns whether anything changed."""
+        changed = False
+        for entity_id in sorted({c["entity_id"] for c in self.state["cleanup"]}):
+            if only is not None and entity_id != only:
+                continue
+            items = await self._items(entity_id, items_by_entity)
+            if items is None:
+                continue  # unavailable or gone: try again later
+            wanted = {c["uid"] for c in self.state["cleanup"] if c["entity_id"] == entity_id}
+            present = [i.uid for i in items if i.uid in wanted]
+            if present:
+                try:
+                    await self.backend.remove(entity_id, present)
+                except Exception as err:  # noqa: BLE001 - kept for the next try
+                    _LOGGER.warning("Couldn't take Simple Aisle's items off %s yet: %s", entity_id, err)
+                    continue
+                items[:] = [i for i in items if i.uid not in wanted]
+            self.state["cleanup"] = [c for c in self.state["cleanup"] if c["entity_id"] != entity_id]
+            changed = True
+        return changed
+
+    async def _retry_unfinished(self, items_by_entity: dict[str, list[Item] | None]) -> bool:
+        """Finishes removals and tombstones that couldn't happen earlier."""
+        changed = await self._run_cleanup(items_by_entity)
+        for entry_id, mapping in list(self.state["mappings"].items()):
+            if mapping.get("pending_tombstone") and await self._settle_tombstone(entry_id, items_by_entity):
+                changed = True
+        return changed
 
     async def _apply_tombstones(
         self, tombstones: list[dict[str, Any]], items_by_entity: dict[str, list[Item] | None]
     ) -> list[str]:
+        """Confirms a tombstone only once HA's item is gone or checked off (or
+        was positively seen not to be there). An unreadable list or a failed
+        write leaves it pending: the app sends it again, and the engine retries
+        on its own (`_retry_unfinished`)."""
         confirmed: list[str] = []
+        todo: list[str] = []
         for tomb in tombstones:
             entry_id = str(tomb.get("entry_id", "")).lower()
             mapping = self._mapping(entry_id)
@@ -667,22 +796,47 @@ class Engine:
                 continue
             if self._has_pending_op(entry_id):
                 continue  # resent next sync, after the HA change is applied
-            entity_id = mapping.get("entity_id")
-            uid = mapping.get("uid")
-            items = items_by_entity.get(entity_id) if entity_id else None
-            present = items is not None and uid is not None and any(i.uid == uid for i in items)
-            if present:
-                if tomb.get("reason") == "purchased" and self.settings.purchased_action == PURCHASED_COMPLETE:
-                    await self.backend.update(entity_id, uid, status=COMPLETED)
+            purchased = tomb.get("reason") == "purchased" and self.settings.purchased_action == PURCHASED_COMPLETE
+            mapping["pending_tombstone"] = "complete" if purchased else "remove"
+            todo.append(entry_id)
+        if todo:
+            await self._commit()  # written down before HA's list is touched
+        for entry_id in todo:
+            if await self._settle_tombstone(entry_id, items_by_entity):
+                confirmed.append(entry_id)
+        return confirmed
+
+    async def _settle_tombstone(self, entry_id: str, items_by_entity: dict[str, list[Item] | None]) -> bool:
+        mapping = self._mapping(entry_id)
+        if mapping is None or not mapping.get("pending_tombstone"):
+            return mapping is None or bool(mapping.get("tombstoned"))
+        entity_id, uid = mapping.get("entity_id"), mapping.get("uid")
+        if entity_id and uid:
+            items = await self._items(entity_id, items_by_entity)
+            if items is None:
+                return False  # can't see the list: not done, try again later
+            item = next((i for i in items if i.uid == uid), None)
+            try:
+                if item is not None and mapping["pending_tombstone"] == "complete":
+                    if item.status != COMPLETED:
+                        await self.backend.update(entity_id, uid, status=COMPLETED)
+                        item.status = COMPLETED
                     self._record_known(entity_id, uid, status=COMPLETED)
-                else:
+                elif item is not None:
                     await self.backend.remove(entity_id, [uid])
+                    items.remove(item)
                     self.state["known"].get(entity_id, {}).pop(uid, None)
                     mapping["uid"] = None
-            mapping["tombstoned"] = True
-            mapping["tombstoned_at"] = self.now()
-            confirmed.append(entry_id)
-        return confirmed
+                else:
+                    self.state["known"].get(entity_id, {}).pop(uid, None)
+                    mapping["uid"] = None
+            except Exception as err:  # noqa: BLE001 - kept pending for the next try
+                _LOGGER.warning("Couldn't update %s for a Simple Aisle change yet: %s", entity_id, err)
+                return False
+        mapping.pop("pending_tombstone", None)
+        mapping["tombstoned"] = True
+        mapping["tombstoned_at"] = self.now()
+        return True
 
     def _record_known(self, entity_id: str, uid: str, **fields: Any) -> None:
         known = self.state["known"].setdefault(entity_id, {})
@@ -705,7 +859,7 @@ class Engine:
             version = int(entry.get("version") or 0)
             mapping = self._mapping(entry_id)
             if mapping is not None:
-                if mapping.get("tombstoned") and not entry.get("revived"):
+                if (mapping.get("tombstoned") or mapping.get("pending_tombstone")) and not entry.get("revived"):
                     continue
                 if version < int(mapping.get("version") or 0):
                     continue
@@ -748,6 +902,7 @@ class Engine:
                     self._record_known(entity_id, uid, **changes)
             self._set_mapping(entry_id, store_id=store_id, entity_id=entity_id, uid=uid,
                               version=max(version, int((mapping or {}).get("version") or 0)), tombstoned=False)
+            self._mapping(entry_id).pop("pending_tombstone", None)
 
         # Duplicates found while applying results.
         for removal in self.state.pop("pending_removals", []):
@@ -808,12 +963,17 @@ class Engine:
             known = self.state["known"].setdefault(entity_id, {})
             for item in items:
                 known[item.uid] = item.snapshot()
+            claimed: set[str] = set()
             for pair in [*matches, *imports]:
                 uid = str(pair.get("uid", ""))
                 entry_id = str(pair.get("entry_id", "")).lower()
                 if uid in uids and entry_id:
                     self._set_mapping(entry_id, store_id=store_id, entity_id=entity_id, uid=uid, version=0,
                                       tombstoned=False)
+                    claimed.add(uid)
+            # Linked again (resumed): items the app just claimed aren't leftovers.
+            self.state["cleanup"] = [c for c in self.state["cleanup"]
+                                     if not (c["entity_id"] == entity_id and c["uid"] in claimed)]
             await self._commit()
             return link
 
@@ -921,8 +1081,11 @@ class Engine:
             if pending_add is not None:
                 pending_add.update(store_id=target_store, entity_id=target_entity, uid=uid)
             elif not any(op["op_id"] == record["move_id"] for op in self.state["ops"]):
+                source_link = self._link_for_entity(source_entity)
                 self._enqueue(OP_MOVE, store_id=target_store, entity_id=target_entity, uid=uid, entry_id=entry_id,
-                              data={"target_store_id": target_store}, op_id=record["move_id"])
+                              data={"target_store_id": target_store,
+                                    "from_store_id": source_link["store_id"] if source_link else None},
+                              op_id=record["move_id"])
             self._set_mapping(entry_id, store_id=target_store, entity_id=target_entity, uid=uid)
         else:
             # Not tracked by Simple Aisle yet: it arrives on the new store.
@@ -946,5 +1109,7 @@ class Engine:
             "ops": {s: sum(1 for o in ops if o["state"] == s)
                     for s in (STATE_PENDING, STATE_DONE, STATE_FAILED, STATE_CANCELLED)},
             "journal": len(self.state["journal"]),
+            "cleanup": len(self.state["cleanup"]),
+            "pending_tombstones": sum(1 for m in self.state["mappings"].values() if m.get("pending_tombstone")),
             "stats": dict(self.state["stats"]),
         }
