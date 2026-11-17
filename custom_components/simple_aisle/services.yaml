@@ -1,0 +1,21 @@
+move_item:
+  fields:
+    entity_id:
+      required: true
+      selector:
+        entity:
+          domain: todo
+    item:
+      required: true
+      example: "Milk"
+      selector:
+        text:
+    target_entity_id:
+      selector:
+        entity:
+          domain: todo
+    target_store_id:
+      advanced: true
+      selector:
+        text:
+request_sync:

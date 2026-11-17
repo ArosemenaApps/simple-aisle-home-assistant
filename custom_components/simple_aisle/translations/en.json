@@ -1,0 +1,63 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Simple Aisle",
+        "description": "Keeps chosen Simple Aisle stores in sync with Home Assistant's own Shopping List and Local To-do lists. After adding it, open **Simple Aisle** in the sidebar and choose **Pair device**, then scan the code with Simple Aisle on your iPhone or iPad (Settings → Integrations → Home Assistant)."
+      }
+    },
+    "abort": {
+      "single_instance_allowed": "Simple Aisle is already set up."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Simple Aisle options",
+        "data": {
+          "purchased_action": "When something is bought in Simple Aisle",
+          "notify_service": "Notify service for sync requests (optional)",
+          "notify_when_waiting": "Notify when changes have waited an hour"
+        },
+        "data_description": {
+          "notify_service": "Home Assistant can't wake Simple Aisle. Request sync sends this notification instead, and tapping it opens Simple Aisle. Separate several with commas.",
+          "notify_when_waiting": "At most one notification an hour."
+        }
+      }
+    }
+  },
+  "selector": {
+    "purchased_action": {
+      "options": {
+        "complete": "Check it off on the Home Assistant list",
+        "remove": "Remove it from the Home Assistant list"
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "pending_changes": {"name": "Changes waiting for a phone"},
+      "paired_devices": {"name": "Paired devices"},
+      "last_sync": {"name": "Last sync"}
+    },
+    "button": {
+      "request_sync": {"name": "Request sync"}
+    }
+  },
+  "services": {
+    "move_item": {
+      "name": "Move item to another store",
+      "description": "Moves an item from one linked list to another. Simple Aisle moves it too, keeping its quantity and note, and records no purchase.",
+      "fields": {
+        "entity_id": {"name": "List", "description": "The linked list the item is on."},
+        "item": {"name": "Item", "description": "The item's name or uid."},
+        "target_entity_id": {"name": "Destination list", "description": "A list linked to another Simple Aisle store."},
+        "target_store_id": {"name": "Destination store ID", "description": "Or the Simple Aisle store's ID."}
+      }
+    },
+    "request_sync": {
+      "name": "Request sync",
+      "description": "Sends the configured notification asking a phone to open Simple Aisle. iOS doesn't let Home Assistant start Simple Aisle by itself."
+    }
+  }
+}
